@@ -10,9 +10,6 @@ import rospkg
 
 from gazebo_simulation import GazeboSimulation
 
-INIT_POSITION = [-2, 3, 1.57]  # in world frame
-GOAL_POSITION = [0, 10]  # relative to the initial position
-
 def compute_distance(p1, p2):
     return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
 
@@ -43,7 +40,7 @@ if __name__ == "__main__":
     
     if args.world_idx < 300:  # static environment from 0-299
         world_name = "BARN/world_%d.world" %(args.world_idx)
-        INIT_POSITION = [-2.25, 3, 1.57]  # in world frame
+        INIT_POSITION = [-2, 3, 1.57]  # in world frame [-2.25, 3, 1.57]
         GOAL_POSITION = [0, 10]  # relative to the initial position
     elif args.world_idx < 360:  # Dynamic environment from 300-359
         world_name = "DynaBARN/world_%d.world" %(args.world_idx - 300)
@@ -70,7 +67,10 @@ if __name__ == "__main__":
     
     rospy.init_node('gym', anonymous=True) #, log_level=rospy.FATAL)
     rospy.set_param('/use_sim_time', True)
-    
+    # *** Set the initial and goal positions as ROS parameters ***
+    rospy.set_param('init_position', INIT_POSITION)
+    rospy.set_param('goal_position', GOAL_POSITION)
+
     # GazeboSimulation provides useful interface to communicate with gazebo  
     gazebo_sim = GazeboSimulation(init_position=INIT_POSITION)
     
@@ -90,37 +90,17 @@ if __name__ == "__main__":
         time.sleep(1)
 
 
-
-
     ##########################################################################################
     ## 1. Launch your navigation stack
     ## (Customize this block to add your own navigation stack)
     ##########################################################################################
     
-    launch_file = join(base_path, '..', 'jackal_helper/launch/move_base_DWA.launch')
+    python_script = './navigation_pkg/scripts/ftg_navigation.py'
+
     nav_stack_process = subprocess.Popen([
-        'roslaunch',
-        launch_file,
+        'python3',
+        python_script,
     ])
-    
-    # Make sure your navigation stack recives the correct goal position defined in GOAL_POSITION
-    import actionlib
-    from geometry_msgs.msg import Quaternion
-    from move_base_msgs.msg import MoveBaseGoal, MoveBaseAction
-    nav_as = actionlib.SimpleActionClient('/move_base', MoveBaseAction)
-    mb_goal = MoveBaseGoal()
-    mb_goal.target_pose.header.frame_id = 'odom'
-    mb_goal.target_pose.pose.position.x = GOAL_POSITION[0]
-    mb_goal.target_pose.pose.position.y = GOAL_POSITION[1]
-    mb_goal.target_pose.pose.position.z = 0
-    mb_goal.target_pose.pose.orientation = Quaternion(0, 0, 0, 1)
-
-    nav_as.wait_for_server()
-    nav_as.send_goal(mb_goal)
-
-
-
-
     ##########################################################################################
     ## 2. Start navigation
     ##########################################################################################
@@ -146,14 +126,11 @@ if __name__ == "__main__":
         curr_time = rospy.get_time()
         pos = gazebo_sim.get_model_state().pose.position
         curr_coor = (pos.x, pos.y)
-        print("Time: %.2f (s), x: %.2f (m), y: %.2f (m)" %(curr_time - start_time, *curr_coor), end="\r")
+        print("Time: %.2f (s), x: %.2f (m), y: %.2f (m)" %(curr_time - start_time, curr_coor[0], curr_coor[1]))
         collided = gazebo_sim.get_hard_collision()
         while rospy.get_time() - curr_time < 0.1:
             time.sleep(0.01)
 
-
-    
-    
     ##########################################################################################
     ## 3. Report metrics and generate log
     ##########################################################################################
@@ -194,3 +171,4 @@ if __name__ == "__main__":
     gazebo_process.wait()
     nav_stack_process.terminate()
     nav_stack_process.wait()
+

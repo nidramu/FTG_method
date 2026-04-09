@@ -4,7 +4,50 @@
 
 --------------------------------------------------------------------------------
 
-# ICRA BARN Navigation Challenge
+# ICRA BARN Navigation Challenge — Follow the Gap Submission
+
+This repository contains a custom navigation stack for the ICRA BARN Challenge based on the **Follow the Gap (FTG)** algorithm. The implementation is purely reactive: it uses only 2D LiDAR data and odometry — no map, no global planner.
+
+## Navigation Stack: Follow the Gap
+
+### How it works
+
+The algorithm runs at 10 Hz and follows these steps on each scan:
+
+1. **LiDAR preprocessing** — raw ranges are clipped to `[min_safe_dist, max_dist]`, NaN/Inf values are replaced, and a 5-point moving average smooths the signal.
+2. **Direct goal check** — if the direction toward the goal is clear and no obstacle is close, the robot drives straight toward the goal (no gap selection needed).
+3. **Safety bubble** — a zero-range bubble is placed around the closest obstacle. Bubble radius scales inversely with obstacle distance, making it tighter for faraway obstacles.
+4. **Gap finding** — contiguous segments of non-zero ranges above `min_gap_threshold` are extracted. Gaps narrower than the robot's physical width (`robot_width + safety_margin`) are discarded; if none pass, the widest available gap is used as a fallback.
+5. **Gap scoring** — each valid gap is scored by a weighted combination of angular distance to the goal direction (weight 0.85) and gap tightness (weight 0.15). Shallow gaps get a penalty.
+6. **Gap hysteresis** — to avoid oscillation, the previously selected gap is preferred when its score is within `gap_switch_score_margin` of the best new gap.
+7. **Heading offset** — the target angle is nudged away from the closer wall of the chosen gap by a footprint offset (`atan2(robot_half_width, gap_depth)`).
+8. **Smoothing** — the heading is exponentially smoothed (`alpha=0.5`), with a hard reset on direction reversals > 90°.
+9. **Velocity control** — linear speed scales with proximity to the nearest obstacle (`[0.35, 1.8] m/s`) and is further reduced for tight gaps and large heading corrections.
+
+### Key parameters
+
+| Parameter | Value | Description |
+|---|---|---|
+| `max_dist` | 4.5 m | LiDAR range cap |
+| `min_safe_dist` | 0.3 m | Ranges below this are zeroed |
+| `robot_width` | 0.43 m | Jackal physical width |
+| `safety_margin` | 0.25 m | Extra clearance added to robot width |
+| `max_v` | 1.8 m/s | Maximum linear speed |
+| `max_w` | 1.5 rad/s | Maximum angular speed |
+| `min_gap_threshold` | 0.8 m | Minimum range for a cell to count as open |
+| `smooth_alpha` | 0.5 | Heading exponential smoothing factor |
+
+### File structure
+
+```
+navigation_pkg/
+└── scripts/
+    └── ftg_navigation.py   # Self-contained FTG node
+run.py                      # BARN harness (launches Gazebo + FTG node)
+Singularityfile.def         # Container definition
+```
+
+---
 
 ## Updates:
 * 01/15/2025: Adding support for ROS2 in [The-Barn-Challenge-Ros2](https://github.com/Saadmaghani/The-Barn-Challenge-Ros2).
