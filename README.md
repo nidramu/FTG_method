@@ -125,6 +125,28 @@ cd the-barn-challenge
 sudo singularity build --notest nav_competition_image.sif Singularityfile.def
 ```
 
+Follow the instruction below to run simulations in Docker containers.
+
+1. Build Docker image
+```
+docker build -t barn-ftg:latest .
+```
+
+2. Run one world in Docker
+```
+./docker_run.sh barn-ftg:latest python3 run.py --world_idx 0
+```
+
+3. Run all 300 static BARN worlds once
+```
+./docker_run.sh barn-ftg:latest bash test_300.sh out_300.txt
+```
+
+4. Run all 300 static BARN worlds with multiple repeats (example: 10)
+```
+REPEATS=10 ./docker_run.sh barn-ftg:latest bash test_300.sh out_300x10.txt
+```
+
 ## Run Simulations
 Navigate to the folder of this repo. Below is the example to run move_base with DWA as local planner.
 
@@ -137,6 +159,11 @@ python3 run.py --world_idx 0
 If you run it in a Singularity container:
 ```
 ./singularity_run.sh /path/to/image/file python3 run.py --world_idx 0
+```
+
+If you run it in a Docker container:
+```
+./docker_run.sh barn-ftg:latest python3 run.py --world_idx 0
 ```
 
 A successful run should print the episode status (collided/succeeded/timeout) and the time cost in second:
@@ -156,7 +183,7 @@ A successful run should print the episode status (collided/succeeded/timeout) an
 ## Test your own navigation stack
 We currently don't provide a lot of instructions or a standard API for implementing the navigation stack, but we might add more in this section depending on people's feedback. If you are new to the ROS or mobile robot navigation, we suggest checking [move_base](http://wiki.ros.org/move_base) which provides basic interface to manipulate a robot.
 
-The suggested work flow is to edit section 1 in `run.py` file (line 89-109) that initialize your own navigation stack. You should not edit other parts in this file. We provide a bash script `test.sh` to run your navigation stack on 50 uniformly sampled BARN worlds with 10 runs for each world. Once the tests finish, run `python report_test.py --out_path /path/to/out/file` to report the test. Below is an example of DWA:
+The suggested work flow is to edit section 1 in `run.py` file (line 89-109) that initialize your own navigation stack. You should not edit other parts in this file. We provide a bash script `test.sh` to run your navigation stack on 50 uniformly sampled BARN worlds with 10 runs for each world. For a full static sweep on all 300 BARN worlds, use `test_300.sh`. Once the 50-world tests finish, run `python report_test.py --out_path /path/to/out/file` to report the test. Below is an example of DWA:
 ```
 python report_test.py --out_path res/dwa_out.txt
 ```

@@ -42,23 +42,9 @@ class FollowTheGap:
        self.current_w = 0.0
        self.latency_dt = 0.08  # 80ms typical for sim; use 0.12-0.15 on physical i3
 
-       # Adaptive latency compensation thresholds
-       # Compensation activates only when environment is tight enough to benefit
-       # from it. In open worlds, skipping compensation avoids unnecessary
-       # bubble inflation and keeps valid gaps intact.
-       self.latency_adaptive_enabled = True   # master switch (True = adaptive mode)
-       self.latency_force_on = False          # debug/override: force ON regardless
-       self.latency_force_off = False         # debug/override: force OFF regardless
-
-       # Activation criteria (all must be true for compensation to activate)
-       self.latency_close_dist_thresh = 1.8   # meters: closest obstacle must be < this
-       self.latency_max_valid_gaps = 2        # valid_gaps must be <= this
-
-       # Hysteresis: once activated, stay active for N frames before re-evaluating
-       # Prevents flicker on/off at threshold boundaries
-       self.latency_active_hold_frames = 5    # ~0.25s at 20Hz
-       self._latency_active_counter = 0
-       self._latency_last_state = False       # for logging transitions
+       # Latency compensation always applied (see navigate()). A/B testing
+       # showed adaptive activation gave no measurable benefit over the noise
+       # floor of Gazebo simulation variance.
 
        # Multi-frame gap_passed filter (Bug #5 fix)
        # Prevents single-frame LiDAR noise spikes from triggering false positives
@@ -92,58 +78,6 @@ class FollowTheGap:
        # Instantaneous velocities for latency compensation
        self.current_v = msg.twist.twist.linear.x
        self.current_w = msg.twist.twist.angular.z
-
-   def should_apply_latency_compensation(self, closest_dist, num_valid_gaps):
-       """
-       Decide whether latency compensation should be applied this frame.
-
-       Based on A/B test results (18 Apr 2026):
-       - Hard worlds (tight, close obstacles): compensation halves collisions
-       - Easy/mid worlds (open, far obstacles): compensation causes timeouts
-
-       Activation criteria (all required):
-       1. Closest obstacle within latency_close_dist_thresh
-       2. Few valid gaps (<= latency_max_valid_gaps) indicating tight passage
-
-       Hysteresis:
-       Once activated, stay active for latency_active_hold_frames to avoid
-       rapid on/off switching at the boundary.
-
-       Returns True if compensation should be applied this frame.
-       """
-       # Debug overrides (for A/B and ablation tests)
-       if self.latency_force_on:
-           return True
-       if self.latency_force_off:
-           return False
-       if not self.latency_adaptive_enabled:
-           return False
-
-       # Primary decision based on current scene
-       is_tight_now = (
-           closest_dist < self.latency_close_dist_thresh
-           and num_valid_gaps <= self.latency_max_valid_gaps
-       )
-
-       # Apply hysteresis: once active, stay active for hold_frames
-       if is_tight_now:
-           self._latency_active_counter = self.latency_active_hold_frames
-           active = True
-       elif self._latency_active_counter > 0:
-           self._latency_active_counter -= 1
-           active = True   # coast on residual activation
-       else:
-           active = False
-
-       # Log state transitions only (not every frame)
-       if active != self._latency_last_state:
-           rospy.logdebug(
-               f"[FTG_LATENCY] state={'ON' if active else 'OFF'} "
-               f"closest={closest_dist:.2f}m valid_gaps={num_valid_gaps}"
-           )
-           self._latency_last_state = active
-
-       return active
 
    def compensate_latency(self, ranges, angle_increment):
        """
@@ -216,42 +150,11 @@ class FollowTheGap:
            math.cos(math.atan2(dy, dx) - robot_yaw),
        )
 
-       # Step 1: preprocess raw ranges once (shared by both paths)
-       raw_ranges = self.preprocess_lidar(data.ranges)
-       n          = len(raw_ranges)
-       quarter    = n // 4
-
-       # Step 2: quick preliminary analysis on RAW ranges to decide compensation
-       raw_front = raw_ranges[quarter : n - quarter]
-       raw_valid_mask = raw_front > 0.1
-       if raw_valid_mask.any():
-           raw_masked = np.where(raw_valid_mask, raw_front, np.inf)
-           prelim_closest = float(raw_front[int(np.argmin(raw_masked))])
-       else:
-           prelim_closest = self.max_dist
-
-       # Quick gap count on raw ranges (no bubble applied yet)
-       # Count how many regions exceed min_gap_threshold as a rough proxy for
-       # valid_gaps. This is an approximation but correlates well in practice.
-       raw_non_zeros = np.where(raw_front > self.min_gap_threshold)[0]
-       if len(raw_non_zeros) > 0:
-           raw_gaps = np.split(raw_non_zeros, np.where(np.diff(raw_non_zeros) > 1)[0] + 1)
-           prelim_gap_count = sum(
-               1 for g in raw_gaps
-               if self.get_gap_physical_width(g, raw_front, data.angle_increment) >= self.min_phys_gap
-           )
-       else:
-           prelim_gap_count = 0
-
-       # Step 3: decide whether to apply latency compensation
-       apply_comp = self.should_apply_latency_compensation(prelim_closest, prelim_gap_count)
-
-       # Step 4: produce final ranges based on decision
-       if apply_comp:
-           ranges = self.compensate_latency(raw_ranges, data.angle_increment)
-       else:
-           ranges = raw_ranges
-
+       # Preprocess and apply latency compensation unconditionally
+       ranges       = self.preprocess_lidar(data.ranges)
+       ranges       = self.compensate_latency(ranges, data.angle_increment)
+       n            = len(ranges)
+       quarter      = n // 4
        front_ranges = ranges[quarter : n - quarter].copy()
 
        valid_mask = front_ranges > 0.1
@@ -375,12 +278,10 @@ class FollowTheGap:
                                     + (1.0 - self.smooth_alpha) * self.smooth_angle)
 
        dropped_gaps = len(gaps) - len(valid_gaps)
-       comp_str = "ON" if apply_comp else "off"
        rospy.loginfo(
            f"[FTG] v={self.current_v:.2f} goal={math.degrees(goal_angle):.1f}° "
            f"closest={closest_dist:.2f}m target={math.degrees(self.smooth_angle):.1f}° "
-           f"gaps={len(gaps)} valid={len(valid_gaps)} dropped={dropped_gaps} "
-           f"comp={comp_str} prelim_close={prelim_closest:.2f} prelim_gaps={prelim_gap_count}"
+           f"gaps={len(gaps)} valid={len(valid_gaps)} dropped={dropped_gaps}"
        )
 
        self.drive(self.smooth_angle, closest_dist, best_phys_w)
