@@ -3,9 +3,19 @@ import rospy
 import numpy as np
 import math
 from collections import deque
+from enum import Enum
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+
+
+class RobotState(Enum):
+    NORMAL          = 0   # Default: run FTG gap analysis
+    HEADING_ALIGN   = 1   # Startup: rotate to goal direction first
+    BACKTRACK       = 2   # Stuck with rear clear: drive backwards 0.3m
+    RECOVERY_ROTATE = 3   # Stuck with rear blocked: rotate to max-clearance
+    DEEP_RECOVERY   = 4   # Multi-stuck: aggressive rotation + FTG reset
+
 
 class FollowTheGap:
    def __init__(self):
@@ -16,7 +26,9 @@ class FollowTheGap:
        self.min_gap_threshold = 0.8
 
        self.robot_width      = 0.43
-       self.safety_margin    = 0.25
+       # Bumped 0.25 -> 0.30 after Faz 1 v4 collision analysis: 57% of
+       # collisions at closest_dist < 0.15m (bumper scraping tight gaps).
+       self.safety_margin    = 0.30
        self.min_phys_gap     = self.robot_width + self.safety_margin
        self.robot_half_width = self.robot_width / 2.0
 
@@ -45,6 +57,55 @@ class FollowTheGap:
        # Latency compensation always applied (see navigate()). A/B testing
        # showed adaptive activation gave no measurable benefit over the noise
        # floor of Gazebo simulation variance.
+
+       # ────────── FAZ 1: FSM + RECOVERY ──────────
+       # Current state — start in HEADING_ALIGN for initial goal alignment
+       self.state = RobotState.HEADING_ALIGN
+
+       # HEADING_ALIGN: rotate in place until within tolerance of goal
+       self.align_tolerance      = math.radians(20.0)  # ±20° considered aligned
+       self.align_w              = 0.8                 # rad/s rotation speed
+       self.align_min_frames     = 10                  # ~0.5s at 20Hz
+       self._align_counter       = 0
+
+       # Stuck detector: pose ring buffer
+       # 30 poses @ 20Hz = 1.5s window. Max displacement < 0.3m AND |v| near zero = stuck.
+       # Stuck window shortened from 1.5s -> 1.0s to catch faster stuck onsets
+       self.stuck_window_frames  = 20                  # 1.0s at 20Hz
+       self.stuck_dist_thresh    = 0.3                 # meters
+       # velocity gate removed — position-only is more reliable indicator
+       # (wall-scraping at 0.1-0.2 m/s was missed; false positives in
+       #  legitimate slow turns were common)
+       self.stuck_min_v          = 0.1                 # kept for compatibility but unused
+       self._pose_history        = deque(maxlen=self.stuck_window_frames)
+
+       # Breadcrumb trail: every 5th frame (0.25s), save pose. ~5s of history.
+       self.breadcrumb_every_n   = 5
+       self.breadcrumb_max_len   = 20
+       self._breadcrumb_counter  = 0
+       self._breadcrumbs         = deque(maxlen=self.breadcrumb_max_len)
+
+       # BACKTRACK: reverse 0.3m straight
+       self.backtrack_distance   = 0.3                 # meters to travel
+       self.backtrack_v          = -0.4                # m/s (negative = reverse)
+       self.backtrack_w          = 0.0                 # straight
+       self._backtrack_start_pos = None                # (x,y) when backtrack began
+
+       # RECOVERY_ROTATE: rotate toward max-clearance direction, 2s timeout
+       self.rot_rec_w            = 0.8                 # rad/s
+       self.rot_rec_timeout_s    = 2.0
+       self._rot_rec_start_time  = None
+       self._rot_rec_target_rel  = 0.0                 # target angle, robot frame
+
+       # DEEP_RECOVERY: stronger rotation, longer timeout
+       self.deep_rec_w           = 1.0                 # rad/s
+       self.deep_rec_timeout_s   = 4.0
+       self._deep_rec_start_time = None
+       self._deep_rec_target_rel = 0.0
+
+       # State-transition tracking
+       self._stuck_count         = 0                   # consecutive stuck detections
+       self._last_state_change_t = None
 
        # Multi-frame gap_passed filter (Bug #5 fix)
        # Prevents single-frame LiDAR noise spikes from triggering false positives
@@ -140,7 +201,231 @@ class FollowTheGap:
            return 0.0
        return float(np.mean(front_ranges[gap])) * len(gap) * angle_increment
 
+   def _change_state(self, new_state, reason=""):
+       """Centralized state transition with log line."""
+       if self.state != new_state:
+           rospy.loginfo(f"[FSM] {self.state.name} -> {new_state.name}  ({reason})")
+           self.state = new_state
+           self._last_state_change_t = rospy.Time.now()
+
+   def _update_pose_history(self):
+       """Record pose in stuck buffer and breadcrumb trail."""
+       x, y, _ = self.curr_pose
+       self._pose_history.append((x, y))
+
+       self._breadcrumb_counter += 1
+       if self._breadcrumb_counter >= self.breadcrumb_every_n:
+           self._breadcrumb_counter = 0
+           self._breadcrumbs.append((x, y, self.curr_pose[2]))
+
+   def _is_stuck(self):
+       """Detect if robot hasn't moved in stuck window AND velocity is near zero."""
+       if len(self._pose_history) < self.stuck_window_frames:
+           return False
+
+       # Max displacement from oldest pose in window
+       x0, y0 = self._pose_history[0]
+       max_dist = 0.0
+       for xi, yi in self._pose_history:
+           d = math.hypot(xi - x0, yi - y0)
+           if d > max_dist:
+               max_dist = d
+
+       # Position-only check: if robot hasn't moved 0.3m in the window, stuck.
+       # Removed velocity gate — it created both false positives (slow
+       # legitimate turns) and false negatives (wall-scraping at 0.1+ m/s,
+       # oscillating in circles without progress).
+       return (max_dist < self.stuck_dist_thresh)
+
+   def _rear_clearance(self, data):
+       """Min LiDAR distance in rear 90° cone. Returns nan if no valid readings."""
+       ranges = np.array(data.ranges, dtype=float)
+       ranges[np.isnan(ranges) | np.isinf(ranges)] = self.max_dist
+       n = len(ranges)
+       # Rear is center 90° of the back half
+       rear_start = 3 * n // 8
+       rear_end   = 5 * n // 8
+       rear = ranges[rear_start:rear_end]
+       valid = rear[rear > 0.1]
+       if len(valid) == 0:
+           return float('nan')
+       return float(np.min(valid))
+
+   def _find_max_clearance_angle(self, data):
+       """Find angle (robot frame) with maximum LiDAR clearance.
+       Used by RECOVERY_ROTATE/DEEP_RECOVERY to pick rotation direction."""
+       ranges = self.preprocess_lidar(data.ranges)
+       n = len(ranges)
+       best_idx = int(np.argmax(ranges))
+       angle = (best_idx - n / 2) * data.angle_increment
+       return angle
+
+   def _goal_angle(self):
+       """Current angle to goal in robot frame, wrapped to [-pi, pi]."""
+       x, y, yaw = self.curr_pose
+       dx = self.goal_world[0] - x
+       dy = self.goal_world[1] - y
+       raw = math.atan2(dy, dx) - yaw
+       return math.atan2(math.sin(raw), math.cos(raw))
+
    def navigate(self, data):
+       """FSM dispatcher. Called every control cycle from run()."""
+       self._update_pose_history()
+
+       # Stuck check runs only in NORMAL state
+       if self.state == RobotState.NORMAL and self._is_stuck():
+           self._stuck_count += 1
+           rear = self._rear_clearance(data)
+
+           # Front clearance: center-half beams, ignore dropouts
+           raw = self.preprocess_lidar(data.ranges)
+           nn = len(raw); qq = nn // 4
+           front_now = raw[qq : nn - qq]
+           valid_now = front_now[front_now > 0.1]
+           front_closest = float(np.min(valid_now)) if len(valid_now) > 0 else self.max_dist
+
+           rear_ok  = (not math.isnan(rear) and rear > 0.5
+                       and len(self._breadcrumbs) >= 2)
+           imminent = (front_closest < 0.25)
+
+           if rear_ok:
+               # Backtrack preferred when rear is clear and we have breadcrumbs
+               self._backtrack_start_pos = (self.curr_pose[0], self.curr_pose[1])
+               self._change_state(RobotState.BACKTRACK,
+                                  f"stuck #{self._stuck_count}, rear={rear:.2f}m front={front_closest:.2f}m")
+           elif imminent:
+               # Rear blocked AND front imminent: skip rotate, go DEEP_RECOVERY
+               self._deep_rec_start_time = rospy.Time.now()
+               self._deep_rec_target_rel = self._find_max_clearance_angle(data)
+               self._change_state(RobotState.DEEP_RECOVERY,
+                                  f"stuck #{self._stuck_count}, imminent front={front_closest:.2f}m")
+           else:
+               # Rotate in place when backtrack unsafe but front has room
+               self._rot_rec_start_time = rospy.Time.now()
+               self._rot_rec_target_rel = self._find_max_clearance_angle(data)
+               self._change_state(RobotState.RECOVERY_ROTATE,
+                                  f"stuck #{self._stuck_count}, rear blocked front={front_closest:.2f}m")
+
+       # Dispatch based on current state
+       if   self.state == RobotState.HEADING_ALIGN:   self._handle_heading_align(data)
+       elif self.state == RobotState.BACKTRACK:       self._handle_backtrack(data)
+       elif self.state == RobotState.RECOVERY_ROTATE: self._handle_recovery_rotate(data)
+       elif self.state == RobotState.DEEP_RECOVERY:   self._handle_deep_recovery(data)
+       else:                                           self._run_ftg(data)
+
+   def _handle_heading_align(self, data):
+       """Rotate in place until aligned with goal within tolerance, then NORMAL.
+
+       Fast path: if already aligned on first frame (robot spawned facing goal),
+       immediately transition to NORMAL with zero rotation perturbation.
+       Without this, the ~0.5s initial spin causes trajectory drift that
+       contaminates smoke-test comparisons.
+       """
+       goal_angle = self._goal_angle()
+
+       if abs(goal_angle) < self.align_tolerance:
+           # Fast path on first aligned frame: skip the 10-frame hold entirely
+           # when we're already aligned at startup. No perturbation.
+           if self._align_counter == 0:
+               self._change_state(RobotState.NORMAL,
+                                  f"already aligned at startup, goal_angle={math.degrees(goal_angle):.1f}°")
+               self.stop_robot()
+               return
+
+           self._align_counter += 1
+           if self._align_counter >= self.align_min_frames:
+               self._change_state(RobotState.NORMAL,
+                                  f"aligned after rotation, goal_angle={math.degrees(goal_angle):.1f}°")
+               self.stop_robot()
+               return
+       else:
+           self._align_counter = 0
+
+       msg = Twist()
+       msg.linear.x  = 0.0
+       msg.angular.z = float(np.clip(math.copysign(self.align_w, goal_angle),
+                                     -self.max_w, self.max_w))
+       self.pub.publish(msg)
+
+   def _handle_backtrack(self, data):
+       """Reverse until backtrack_distance traveled or rear becomes blocked."""
+       sx, sy = self._backtrack_start_pos
+       cx, cy = self.curr_pose[0], self.curr_pose[1]
+       traveled = math.hypot(cx - sx, cy - sy)
+       rear = self._rear_clearance(data)
+
+       if traveled >= self.backtrack_distance:
+           self._change_state(RobotState.NORMAL, f"backtrack done, {traveled:.2f}m")
+           self._pose_history.clear()  # reset stuck detector
+           self.stop_robot()
+           return
+
+       if not math.isnan(rear) and rear < 0.3:
+           # Rear became blocked mid-backtrack: switch to rotate
+           self._rot_rec_start_time = rospy.Time.now()
+           self._rot_rec_target_rel = self._find_max_clearance_angle(data)
+           self._change_state(RobotState.RECOVERY_ROTATE,
+                              f"rear blocked during backtrack, rear={rear:.2f}m")
+           return
+
+       msg = Twist()
+       msg.linear.x  = self.backtrack_v
+       msg.angular.z = self.backtrack_w
+       self.pub.publish(msg)
+
+   def _handle_recovery_rotate(self, data):
+       """Rotate toward max-clearance until timeout; on timeout escalate or retry."""
+       if self._rot_rec_start_time is None:
+           self._rot_rec_start_time = rospy.Time.now()
+           self._rot_rec_target_rel = self._find_max_clearance_angle(data)
+
+       elapsed = (rospy.Time.now() - self._rot_rec_start_time).to_sec()
+
+       if elapsed > self.rot_rec_timeout_s:
+           if self._stuck_count >= 2:
+               # Repeated stuck: escalate to DEEP_RECOVERY
+               self._deep_rec_start_time = rospy.Time.now()
+               self._deep_rec_target_rel = self._find_max_clearance_angle(data)
+               self._change_state(RobotState.DEEP_RECOVERY,
+                                  f"rot timeout, stuck_count={self._stuck_count}")
+           else:
+               self._change_state(RobotState.NORMAL, "rot timeout, retry FTG")
+               self._pose_history.clear()
+           self._rot_rec_start_time = None
+           self.stop_robot()
+           return
+
+       msg = Twist()
+       msg.linear.x  = 0.0
+       msg.angular.z = float(np.clip(math.copysign(self.rot_rec_w, self._rot_rec_target_rel),
+                                     -self.max_w, self.max_w))
+       self.pub.publish(msg)
+
+   def _handle_deep_recovery(self, data):
+       """Stronger rotation, longer timeout, full state reset on exit."""
+       if self._deep_rec_start_time is None:
+           self._deep_rec_start_time = rospy.Time.now()
+           self._deep_rec_target_rel = self._find_max_clearance_angle(data)
+
+       elapsed = (rospy.Time.now() - self._deep_rec_start_time).to_sec()
+
+       if elapsed > self.deep_rec_timeout_s:
+           self._change_state(RobotState.NORMAL, "deep recovery timeout, full reset")
+           # Full reset: give FTG a truly fresh start
+           self._stuck_count = 0
+           self._pose_history.clear()
+           self._breadcrumbs.clear()
+           self._deep_rec_start_time = None
+           self.stop_robot()
+           return
+
+       msg = Twist()
+       msg.linear.x  = 0.0
+       msg.angular.z = float(np.clip(math.copysign(self.deep_rec_w, self._deep_rec_target_rel),
+                                     -self.max_w, self.max_w))
+       self.pub.publish(msg)
+
+   def _run_ftg(self, data):
        robot_x, robot_y, robot_yaw = self.curr_pose
 
        dx = self.goal_world[0] - robot_x
@@ -285,6 +570,10 @@ class FollowTheGap:
        )
 
        self.drive(self.smooth_angle, closest_dist, best_phys_w)
+
+       # If FTG is driving successfully, clear stuck counter
+       if abs(self.current_v) > 0.3:
+           self._stuck_count = 0
 
    def drive(self, angle, closest_dist, gap_phys_w):
        msg = Twist()
