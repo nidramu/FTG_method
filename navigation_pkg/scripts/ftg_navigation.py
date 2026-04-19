@@ -25,6 +25,25 @@ class FollowTheGap:
 
        self.lookahead = 1.0
 
+       # Faz 4 v3: v1 base + startup + angular-aware brake
+       # v1 worked (+3pp vs Faz 0). v2 regressed (-12pp from loop-detect).
+       # v3 adds two targeted fixes on v1 base.
+       self.SA_SAFE_DIST     = 0.8
+       self.SA_TRANSITION    = 0.5
+       self.SA_CRITICAL      = 0.3
+       self.SA_IMMINENT      = 0.2
+       self.SA_CRITICAL_CAP  = 0.4
+       self.SA_IMMINENT_CAP  = 0.2
+
+       # v3 NEW: startup brake — first 1s robot capped at 1.0 m/s
+       self.SA_STARTUP_DURATION = 1.0
+       self.SA_STARTUP_V_MAX    = 1.0
+       self._sa_start_time      = None
+
+       # v3 NEW: angular-aware brake — sharp turns reduce v by 30%
+       self.SA_ANGULAR_THRESH   = 1.0
+       self.SA_ANGULAR_FACTOR   = 0.7
+
        self.init_pos = rospy.get_param('init_position', [-2, 3, 1.57])
        self.goal_rel = rospy.get_param('goal_position', [0, 10])
        self.goal_world = [
@@ -286,6 +305,40 @@ class FollowTheGap:
 
        self.drive(self.smooth_angle, closest_dist, best_phys_w)
 
+   def _apply_slow_approach(self, v_proposed, closest_dist, w_proposed=0.0):
+       """Reactive brake v3: v1 base + startup + angular-aware.
+
+       Layers (in order):
+       1. v1 zone-based obstacle brake (unchanged)
+       2. Startup cap: first 1.0s max 1.0 m/s
+       3. Angular-aware: sharp turns reduce v by 30%
+       """
+       # Layer 1: v1 zone-based obstacle brake
+       if closest_dist > self.SA_SAFE_DIST:
+           v_safe = v_proposed
+       elif closest_dist > self.SA_TRANSITION:
+           t = (closest_dist - self.SA_TRANSITION) / (self.SA_SAFE_DIST - self.SA_TRANSITION)
+           scale = 0.4 + 0.6 * t
+           v_safe = v_proposed * scale
+       elif closest_dist > self.SA_CRITICAL:
+           v_safe = min(v_proposed, self.SA_CRITICAL_CAP)
+       else:
+           v_safe = min(v_proposed, self.SA_IMMINENT_CAP)
+
+       # Layer 2: startup cap (first 1s at max 1.0 m/s)
+       now = rospy.Time.now()
+       if self._sa_start_time is None:
+           self._sa_start_time = now
+       elapsed = (now - self._sa_start_time).to_sec()
+       if elapsed < self.SA_STARTUP_DURATION:
+           v_safe = min(v_safe, self.SA_STARTUP_V_MAX)
+
+       # Layer 3: angular-aware brake (sharp turns reduce v)
+       if abs(w_proposed) > self.SA_ANGULAR_THRESH:
+           v_safe *= self.SA_ANGULAR_FACTOR
+
+       return v_safe
+
    def drive(self, angle, closest_dist, gap_phys_w):
        msg = Twist()
 
@@ -303,7 +356,17 @@ class FollowTheGap:
        tight_factor = 1.0 - 0.4 * tightness ** 1.5
        base_v     = base_v * tight_factor
 
-       msg.linear.x = float(base_v)
+       # FAZ 4: SLOW_APPROACH minimal reactive brake
+       v_safe = self._apply_slow_approach(base_v, closest_dist, msg.angular.z)
+
+       if not hasattr(self, '_sa_counter'):
+           self._sa_counter = 0
+       self._sa_counter += 1
+       if self._sa_counter % 10 == 0 and v_safe < base_v * 0.95:
+           rospy.loginfo(f"[SA] brake: v {base_v:.2f} -> {v_safe:.2f} "
+                         f"(close={closest_dist:.2f}m)")
+
+       msg.linear.x = float(v_safe)
        self.pub.publish(msg)
 
    def stop_robot(self):
