@@ -25,15 +25,14 @@ class FollowTheGap:
 
        self.lookahead = 1.0
 
-       # Faz 4 v3: v1 base + startup + angular-aware brake
-       # v1 worked (+3pp vs Faz 0). v2 regressed (-12pp from loop-detect).
-       # v3 adds two targeted fixes on v1 base.
+       # Faz 4 v4.1: v3 base + five fatal-bug fixes (blind spot, imminent cap,
+       # stuck-escape forward velocity, bubble overgrowth, fallback squeeze).
        self.SA_SAFE_DIST     = 0.8
        self.SA_TRANSITION    = 0.5
        self.SA_CRITICAL      = 0.3
        self.SA_IMMINENT      = 0.2
        self.SA_CRITICAL_CAP  = 0.4
-       self.SA_IMMINENT_CAP  = 0.2
+       self.SA_IMMINENT_CAP  = 0.0
 
        # v3 NEW: startup brake — first 1s robot capped at 1.0 m/s
        self.SA_STARTUP_DURATION = 1.0
@@ -43,6 +42,27 @@ class FollowTheGap:
        # v3 NEW: angular-aware brake — sharp turns reduce v by 30%
        self.SA_ANGULAR_THRESH   = 1.0
        self.SA_ANGULAR_FACTOR   = 0.7
+
+       # ═══════════════════════════════════════════════════════════════════
+       # FAZ 4 v4: stuck-escape for dead-zone timeout pattern
+       # v3 had 7 timeouts all at closest≈0.30m, v=0.
+       # Trigger: ALL THREE must hold
+       #   - closest_dist in critical zone (< SA_ESC_DIST_MAX)
+       #   - current_v below SA_ESC_V_MAX (genuinely not moving)
+       #   - sustained for SA_ESC_TRIGGER_FRAMES (2 seconds at 20Hz)
+       # Effect: bypass brake for SA_ESC_BYPASS_FRAMES (1.5s)
+       # Without triggering false positives in normal slow corridors,
+       # because velocity gate is tight (0.05 m/s = essentially stopped).
+       # ═══════════════════════════════════════════════════════════════════
+       self.SA_ESC_DIST_MAX        = 0.45  # m, only fire when we're in/near crit zone
+       self.SA_ESC_V_MAX           = 0.05  # m/s, must be essentially stopped
+       self.SA_ESC_TRIGGER_FRAMES  = 40    # 2.0s at 20Hz: sustained stuck
+       self.SA_ESC_BYPASS_FRAMES   = 30    # 1.5s: escape window
+       self.SA_ESC_COOLDOWN_FRAMES = 40    # 2.0s: wait before can re-trigger
+
+       self._sa_esc_stuck_count    = 0     # consecutive frames that match stuck pattern
+       self._sa_esc_bypass_left    = 0     # remaining frames of active bypass
+       self._sa_esc_cooldown_left  = 0     # remaining frames of cooldown
 
        self.init_pos = rospy.get_param('init_position', [-2, 3, 1.57])
        self.goal_rel = rospy.get_param('goal_position', [0, 10])
@@ -148,10 +168,10 @@ class FollowTheGap:
 
    def preprocess_lidar(self, ranges):
        proc = np.array(ranges, dtype=float)
-       proc[proc < self.min_safe_dist] = 0.0
-       proc[np.isnan(proc)]            = 0.0
+       # Removed the line that zeroes out data below min_safe_dist
+       proc[np.isnan(proc)]            = 0.01
        proc[np.isinf(proc)]            = self.max_dist
-       proc = np.clip(proc, 0.0, self.max_dist)
+       proc = np.clip(proc, 0.01, self.max_dist)
        return np.convolve(proc, np.ones(5) / 5, mode='same')
 
    def get_gap_physical_width(self, gap, front_ranges, angle_increment):
@@ -215,13 +235,20 @@ class FollowTheGap:
            rospy.logdebug(f"[FTG] Open field, angle={math.degrees(goal_angle):.1f}°")
            return
 
-       bubble_r = max(int(math.atan2(self.robot_half_width + self.safety_margin,
-                                          max(closest_dist, 0.2)) / data.angle_increment), 5)
+       raw_bubble_angle = math.atan2(self.robot_half_width + self.safety_margin, max(closest_dist, 0.2))
+       max_bubble_angle = math.radians(40)  # Cap bubble growth
+       safe_bubble_angle = min(raw_bubble_angle, max_bubble_angle)
+
+       bubble_r = max(int(safe_bubble_angle / data.angle_increment), 5)
+
        if abs(closest_idx - len(front_ranges) // 2) > len(front_ranges) * 0.35:
            bubble_r = bubble_r // 2
+
        start_b = max(0,                 closest_idx - bubble_r)
        end_b   = min(len(front_ranges), closest_idx + bubble_r)
-       front_ranges[start_b:end_b] = 0.0
+
+       # Use 0.1 penalty instead of 0.0 to prevent inf manipulation issues
+       front_ranges[start_b:end_b] = 0.1
 
        non_zeros = np.where(front_ranges > self.min_gap_threshold)[0]
        if len(non_zeros) == 0:
@@ -240,13 +267,12 @@ class FollowTheGap:
            if self.get_gap_physical_width(g, front_ranges, data.angle_increment) >= self.min_phys_gap
        ]
        if not valid_gaps:
-           fallback = [(g, self.get_gap_physical_width(g, front_ranges, data.angle_increment))
-                       for g in gaps if len(g) > 2]
-           if not fallback:
-               self.stop_robot()
-               return
-           valid_gaps = [max(fallback, key=lambda x: x[1])]
-           rospy.logwarn(f"[FTG] Fallback gap: {valid_gaps[0][1]:.2f}m")
+           # FATAL BUG FIXED: Do not force robot into gaps smaller than min_phys_gap
+           rospy.logwarn(f"[FTG] Dead-end! No gaps >= {self.min_phys_gap:.2f}m. Spinning in place.")
+           self.smooth_angle = goal_angle
+           # Pass 0.1m as closest_dist to force SA_IMMINENT_CAP (0.0 linear speed)
+           self.drive(goal_angle, 0.1, self.min_phys_gap)
+           return
 
        max_goal_dist = len(front_ranges) - 1
        max_tightness = 1.0
@@ -305,69 +331,107 @@ class FollowTheGap:
 
        self.drive(self.smooth_angle, closest_dist, best_phys_w)
 
-   def _apply_slow_approach(self, v_proposed, closest_dist, w_proposed=0.0):
-       """Reactive brake v3: v1 base + startup + angular-aware.
+   def _apply_slow_approach(self, v_proposed, closest_dist, w_proposed=0.0, is_dead_end=False):
+        """Reactive brake v5: v3 layers + creep-escape + dead-end bypass.
 
-       Layers (in order):
-       1. v1 zone-based obstacle brake (unchanged)
-       2. Startup cap: first 1.0s max 1.0 m/s
-       3. Angular-aware: sharp turns reduce v by 30%
-       """
-       # Layer 1: v1 zone-based obstacle brake
-       if closest_dist > self.SA_SAFE_DIST:
-           v_safe = v_proposed
-       elif closest_dist > self.SA_TRANSITION:
-           t = (closest_dist - self.SA_TRANSITION) / (self.SA_SAFE_DIST - self.SA_TRANSITION)
-           scale = 0.4 + 0.6 * t
-           v_safe = v_proposed * scale
-       elif closest_dist > self.SA_CRITICAL:
-           v_safe = min(v_proposed, self.SA_CRITICAL_CAP)
-       else:
-           v_safe = min(v_proposed, self.SA_IMMINENT_CAP)
+        Layers:
+        1. Stuck-escape check (pure angular recovery, no forward bypass)
+        2. Zone-based obstacle brake (v3)
+        3. Startup cap (v3)
+        4. Angular-aware (v3)
+        """
+        # Dead-end bypass: caller handles pure rotation command, no forward motion.
+        if is_dead_end:
+            return 0.0
 
-       # Layer 2: startup cap (first 1s at max 1.0 m/s)
-       now = rospy.Time.now()
-       if self._sa_start_time is None:
-           self._sa_start_time = now
-       elapsed = (now - self._sa_start_time).to_sec()
-       if elapsed < self.SA_STARTUP_DURATION:
-           v_safe = min(v_safe, self.SA_STARTUP_V_MAX)
+        # Layer 1: stuck-escape check (NEW in v5)
+        if self._sa_esc_cooldown_left > 0:
+            self._sa_esc_cooldown_left -= 1
+            self._sa_esc_stuck_count = 0
+        elif self._sa_esc_bypass_left > 0:
+            self._sa_esc_bypass_left -= 1
+            if self._sa_esc_bypass_left == 0:
+                self._sa_esc_cooldown_left = self.SA_ESC_COOLDOWN_FRAMES
+                self._sa_esc_stuck_count = 0
+            return max(v_proposed, self.SA_ESC_V_MAX)
+        else:
+            is_stuck_pattern = (closest_dist < self.SA_ESC_DIST_MAX
+                                and abs(self.current_v) < self.SA_ESC_V_MAX)
+            if is_stuck_pattern:
+                self._sa_esc_stuck_count += 1
+                if self._sa_esc_stuck_count >= self.SA_ESC_TRIGGER_FRAMES:
+                    self._sa_esc_bypass_left = self.SA_ESC_BYPASS_FRAMES
+                    rospy.logwarn(f"[SA] ESC triggered: close={closest_dist:.2f}m "
+                                  f"v={self.current_v:.3f}m/s after "
+                                  f"{self._sa_esc_stuck_count} frames")
+                    return max(v_proposed, self.SA_ESC_V_MAX)
+            else:
+                self._sa_esc_stuck_count = 0
 
-       # Layer 3: angular-aware brake (sharp turns reduce v)
-       if abs(w_proposed) > self.SA_ANGULAR_THRESH:
-           v_safe *= self.SA_ANGULAR_FACTOR
+        # Layer 2: v3 zone-based obstacle brake
+        if closest_dist > self.SA_SAFE_DIST:
+            v_safe = v_proposed
+        elif closest_dist > self.SA_TRANSITION:
+            t = (closest_dist - self.SA_TRANSITION) / (self.SA_SAFE_DIST - self.SA_TRANSITION)
+            scale = 0.4 + 0.6 * t
+            v_safe = v_proposed * scale
+        elif closest_dist > self.SA_CRITICAL:
+            v_safe = min(v_proposed, self.SA_CRITICAL_CAP)
+        else:
+            v_safe = min(v_proposed, self.SA_IMMINENT_CAP)
 
-       return v_safe
+        # Layer 3: startup cap (v3)
+        now = rospy.Time.now()
+        if self._sa_start_time is None:
+            self._sa_start_time = now
+        elapsed = (now - self._sa_start_time).to_sec()
+        if elapsed < self.SA_STARTUP_DURATION:
+            v_safe = min(v_safe, self.SA_STARTUP_V_MAX)
+
+        # Layer 4: angular-aware (v3)
+        if abs(w_proposed) > self.SA_ANGULAR_THRESH:
+            v_safe *= self.SA_ANGULAR_FACTOR
+
+        return v_safe
 
    def drive(self, angle, closest_dist, gap_phys_w):
-       msg = Twist()
+        msg = Twist()
 
-       lateral       = self.lookahead * math.sin(angle)
-       curvature     = 2.0 * lateral / (self.lookahead ** 2)
-       msg.angular.z = float(np.clip(curvature * self.max_v, -self.max_w, self.max_w))
+        lateral       = self.lookahead * math.sin(angle)
+        curvature     = 2.0 * lateral / (self.lookahead ** 2)
+        msg.angular.z = float(np.clip(curvature * self.max_v, -self.max_w, self.max_w))
 
-       base_v = float(np.interp(closest_dist,
-                                [0.3, 0.8, 1.5, 3.0],
-                                [0.35, 0.7, 1.2, self.max_v]))
+        base_v = float(np.interp(closest_dist,
+                                 [0.3, 0.8, 1.5, 3.0],
+                                 [0.35, 0.7, 1.2, self.max_v]))
 
-       base_v *= float(np.interp(abs(angle), [0.3, 0.8, 1.2], [1.0, 0.7, 0.4]))
+        base_v *= float(np.interp(abs(angle), [0.3, 0.8, 1.2], [1.0, 0.7, 0.4]))
 
-       tightness  = self.min_phys_gap / max(gap_phys_w, self.min_phys_gap)
-       tight_factor = 1.0 - 0.4 * tightness ** 1.5
-       base_v     = base_v * tight_factor
+        tightness    = self.min_phys_gap / max(gap_phys_w, self.min_phys_gap)
+        tight_factor = 1.0 - 0.4 * tightness ** 1.5
+        base_v       = base_v * tight_factor
 
-       # FAZ 4: SLOW_APPROACH minimal reactive brake
-       v_safe = self._apply_slow_approach(base_v, closest_dist, msg.angular.z)
+        is_dead_end = (closest_dist < self.SA_IMMINENT and gap_phys_w <= self.min_phys_gap * 1.05)
+        if is_dead_end:
+            msg.angular.z = 1.0 if angle >= 0.0 else -1.0
 
-       if not hasattr(self, '_sa_counter'):
-           self._sa_counter = 0
-       self._sa_counter += 1
-       if self._sa_counter % 10 == 0 and v_safe < base_v * 0.95:
-           rospy.loginfo(f"[SA] brake: v {base_v:.2f} -> {v_safe:.2f} "
-                         f"(close={closest_dist:.2f}m)")
+        # FAZ 4 v5: SLOW_APPROACH with dead-end bypass hook
+        v_safe = self._apply_slow_approach(
+            base_v, closest_dist, msg.angular.z, is_dead_end=is_dead_end
+        )
 
-       msg.linear.x = float(v_safe)
-       self.pub.publish(msg)
+        if not hasattr(self, '_sa_counter'):
+            self._sa_counter = 0
+        self._sa_counter += 1
+        if self._sa_counter % 10 == 0 and v_safe < base_v * 0.95:
+            rospy.loginfo(f"[SA] brake: v {base_v:.2f} -> {v_safe:.2f} "
+                          f"(close={closest_dist:.2f}m)")
+
+        if v_safe < 0.15 and abs(msg.angular.z) < 0.1:
+            msg.angular.z = 0.3 * (1.0 if msg.angular.z >= 0.0 else -1.0)
+
+        msg.linear.x = float(v_safe)
+        self.pub.publish(msg)
 
    def stop_robot(self):
        self.pub.publish(Twist())
